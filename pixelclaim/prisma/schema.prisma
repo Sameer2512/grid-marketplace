@@ -1,0 +1,408 @@
+// PixelClaim — Prisma Schema
+// ORM: Prisma v7  |  DB: PostgreSQL (Supabase)
+//
+// MVP constraints applied:
+//  - Blocks are 1×1 only (no width/height fields)
+//  - Only ONE active BlockContent per block (enforced in application logic on approval)
+//  - Block reservation system with 10-min TTL for race-condition-safe purchases
+//  - Moderation always falls back to human review if AI fails
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum BlockStatus {
+  AVAILABLE
+  RESERVED        // held during Stripe checkout (10-min TTL)
+  SOLD
+  ADMIN_LOCKED    // frozen by admin, not purchasable
+}
+
+enum ContentModerationStatus {
+  PENDING          // just uploaded, awaiting pipeline
+  AI_SCANNING      // Phase 2: being processed by AI handler
+  PENDING_REVIEW   // in human review queue (also the AI fallback state)
+  APPROVED         // content is live on the grid
+  AUTO_APPROVED    // approved by AI with high confidence (Phase 2)
+  FLAGGED          // AI found something suspicious, escalated to human
+  REJECTED         // denied by admin, user notified
+}
+
+enum ModerationAction {
+  SUBMITTED
+  AI_SCAN_STARTED
+  AI_SCAN_COMPLETED
+  AI_FLAGGED
+  ESCALATED_TO_HUMAN  // AI fallback — always goes here on error
+  ADMIN_APPROVED
+  ADMIN_REJECTED
+  USER_RESUBMITTED
+}
+
+enum ActorType {
+  USER
+  ADMIN
+  MODERATOR
+  SYSTEM
+  AI
+}
+
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  REFUNDED        // auto-refunded if block was already sold when webhook fired
+}
+
+enum ActivityType {
+  BLOCK_PURCHASED
+  BLOCK_CONTENT_APPROVED
+  ZONE_TRENDING
+}
+
+enum PricingRuleType {
+  BASE_PRICE
+  LOCATION_MULTIPLIER
+  DEMAND_MULTIPLIER
+  PROXIMITY_MULTIPLIER
+  TIME_MULTIPLIER
+  ADMIN_OVERRIDE
+}
+
+// ─────────────────────────────────────────────────────────────────
+// USERS
+// Clerk manages the identity layer. We mirror the user here for
+// relational integrity, analytics, and app-level metadata.
+// ─────────────────────────────────────────────────────────────────
+
+model User {
+  id               String   @id @default(cuid())
+  clerkId          String   @unique
+  email            String   @unique
+  username         String   @unique
+  displayName      String?
+  avatarUrl        String?
+  role             UserRole @default(USER)
+  stripeCustomerId String?  @unique
+
+  // Referral system
+  referralCode     String   @unique @default(cuid())
+  referredById     String?
+  referredBy       User?    @relation("Referrals", fields: [referredById], references: [id])
+  referrals        User[]   @relation("Referrals")
+
+  // Credits earned from referrals (stored in cents)
+  creditBalance    Int      @default(0)
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  // Relations
+  ownedBlocks      Block[]
+  blockContents    BlockContent[]
+  transactions     Transaction[]
+  activityFeed     ActivityFeed[]
+  moderationReviews ModerationQueue[] @relation("ReviewedBy")
+
+  @@index([clerkId])
+  @@index([email])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PRICING ZONES
+// Admin-defined rectangular regions with a price multiplier.
+// Multiple zones can overlap; the highest multiplier wins (handled in engine).
+// ─────────────────────────────────────────────────────────────────
+
+model PricingZone {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  multiplier  Decimal  @db.Decimal(5, 2) // e.g., 3.00 = 3× base price
+  color       String   @default("#FF6B6B") // hex color for admin heatmap
+  isActive    Boolean  @default(true)
+  isTrending  Boolean  @default(false)
+  // Bounding box (inclusive, 0-indexed)
+  xMin        Int
+  xMax        Int
+  yMin        Int
+  yMax        Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isActive])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// BLOCKS — The core unit of the grid.
+// Grid is 100×100 = 10,000 blocks for MVP.
+// All blocks are 1×1 (multi-block purchases are a post-MVP feature).
+// ─────────────────────────────────────────────────────────────────
+
+model Block {
+  id            String      @id @default(cuid())
+  x             Int         // column (0–99)
+  y             Int         // row (0–99)
+  status        BlockStatus @default(AVAILABLE)
+
+  // Ownership
+  ownerId       String?
+  owner         User?       @relation(fields: [ownerId], references: [id])
+  purchasedAt   DateTime?
+
+  // Pricing — currentPrice is computed by the engine and cached here.
+  // priceOverride, if set, bypasses all computation (admin use only).
+  currentPrice  Decimal     @db.Decimal(10, 2) @default(1.00)
+  priceOverride Decimal?    @db.Decimal(10, 2)
+
+  // Reservation lock for concurrent purchase protection.
+  // A block in RESERVED status is held for the user below for 10 minutes.
+  // The Stripe webhook checks reservedBy === paying userId before confirming.
+  reservedById  String?     // userId who holds the reservation
+  reservedUntil DateTime?   // expiry timestamp; job clears expired reservations
+
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  // Relations
+  contents      BlockContent[]
+  transactions  Transaction[]
+  priceHistory  BlockPriceHistory[]
+  activityFeed  ActivityFeed[]
+
+  @@unique([x, y])
+  @@index([status])
+  @@index([ownerId])
+  @@index([reservedById])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// BLOCK CONTENT — The uploaded image/GIF attached to a block.
+// Versioned: users can replace content, each version goes through moderation.
+// Only one record per block may have isActive = true at any time.
+// This is enforced in application logic during the approval action.
+// ─────────────────────────────────────────────────────────────────
+
+model BlockContent {
+  id                 String                  @id @default(cuid())
+  blockId            String
+  block              Block                   @relation(fields: [blockId], references: [id])
+  userId             String
+  user               User                    @relation(fields: [userId], references: [id])
+
+  // Storage
+  // storagePath: private Supabase bucket path (pending/)
+  // imageUrl: public CDN URL, only set AFTER admin approval
+  storagePath        String
+  imageUrl           String?
+  thumbnailUrl       String?
+
+  // Optional link and accessibility text
+  linkUrl            String?
+  altText            String?
+  title              String?
+
+  // File metadata (validated on upload)
+  mimeType           String                  // e.g., "image/png", "image/gif"
+  fileSizeBytes      Int
+  widthPx            Int?
+  heightPx           Int?
+
+  // Moderation state
+  moderationStatus   ContentModerationStatus @default(PENDING)
+  isActive           Boolean                 @default(false) // true = shown on grid
+  version            Int                     @default(1)
+
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+
+  // Relations
+  moderationQueue    ModerationQueue?
+
+  @@index([blockId, isActive])
+  @@index([moderationStatus])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MODERATION QUEUE — One entry per BlockContent upload.
+// Phase 1: goes straight to PENDING_REVIEW for admin action.
+// Phase 2: AI handler runs first; falls back to PENDING_REVIEW on any error.
+// ─────────────────────────────────────────────────────────────────
+
+model ModerationQueue {
+  id              String                  @id @default(cuid())
+  blockContentId  String                  @unique
+  blockContent    BlockContent            @relation(fields: [blockContentId], references: [id])
+
+  status          ContentModerationStatus @default(PENDING)
+
+  // Priority: admin sorts queue by this (higher = reviewed sooner).
+  // Flagged content auto-gets higher priority.
+  priority        Int                     @default(0)
+
+  // AI scan fields (all nullable — only populated in Phase 2)
+  aiProvider      String?                 // e.g., "aws-rekognition"
+  aiScanResult    Json?                   // raw API response (stored for audit)
+  aiConfidence    Float?                  // 0.0–1.0
+  aiFlags         String[]                // ["nudity", "violence", "hate"]
+  aiDecision      String?                 // "safe" | "suspicious" | "rejected"
+
+  // Human review fields
+  reviewedById    String?
+  reviewedBy      User?                   @relation("ReviewedBy", fields: [reviewedById], references: [id])
+  reviewedAt      DateTime?
+  rejectionReason String?                 // shown to user on rejection
+  internalNotes   String?                 // admin-only notes, not shown to user
+
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+
+  logs            ModerationLog[]
+
+  @@index([status, priority])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// MODERATION LOG — Immutable audit trail for every state change.
+// actorId is null for system/AI-triggered actions.
+// ─────────────────────────────────────────────────────────────────
+
+model ModerationLog {
+  id                String           @id @default(cuid())
+  moderationQueueId String
+  moderationQueue   ModerationQueue  @relation(fields: [moderationQueueId], references: [id])
+  action            ModerationAction
+  actorId           String?          // null = automated action
+  actorType         ActorType
+  metadata          Json?            // flexible: AI payload, rejection reason, etc.
+  createdAt         DateTime         @default(now())
+
+  @@index([moderationQueueId])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PRICING RULES — All pricing parameters live here, editable by admin.
+// The PricingEngine reads active rules at calculation time.
+// config shape varies by type (see lib/pricing/engine.ts for expected shapes).
+// ─────────────────────────────────────────────────────────────────
+
+model PricingRule {
+  id          String          @id @default(cuid())
+  name        String
+  description String?
+  type        PricingRuleType
+  config      Json            // type-specific parameters
+  isActive    Boolean         @default(true)
+  priority    Int             @default(0) // higher = applied first when types conflict
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([isActive, type])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// BLOCK PRICE HISTORY — Records every price recalculation.
+// Used for analytics and trend visualization.
+// ─────────────────────────────────────────────────────────────────
+
+model BlockPriceHistory {
+  id           String   @id @default(cuid())
+  blockId      String
+  block        Block    @relation(fields: [blockId], references: [id])
+  price        Decimal  @db.Decimal(10, 2)
+  // breakdown stores the multiplier components for transparency
+  breakdown    Json     // { base, locationMult, demandMult, proximityMult, final }
+  reason       String?  // e.g., "neighboring block purchased", "admin rule updated"
+  calculatedAt DateTime @default(now())
+
+  @@index([blockId])
+  @@index([calculatedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// TRANSACTIONS — One record per Stripe Checkout attempt.
+// On webhook receipt, we verify the reservation before marking COMPLETED.
+// If verification fails, status becomes REFUNDED and Stripe refund is issued.
+// ─────────────────────────────────────────────────────────────────
+
+model Transaction {
+  id                    String            @id @default(cuid())
+  userId                String
+  user                  User              @relation(fields: [userId], references: [id])
+  blockId               String
+  block                 Block             @relation(fields: [blockId], references: [id])
+
+  // Stripe identifiers
+  stripeSessionId       String?           @unique // Checkout Session ID
+  stripePaymentIntentId String?           @unique
+  stripeChargeId        String?
+
+  amount                Decimal           @db.Decimal(10, 2) // USD
+  currency              String            @default("usd")
+  status                TransactionStatus @default(PENDING)
+
+  // Snapshot of pricing factors at purchase time (for auditing/disputes)
+  priceSnapshot         Json?
+
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  @@index([userId])
+  @@index([blockId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ACTIVITY FEED — Powers the live "X just bought a block!" ticker.
+// Written to on block purchase and content approval.
+// Supabase Realtime subscribes to this table's INSERT events.
+// ─────────────────────────────────────────────────────────────────
+
+model ActivityFeed {
+  id        String       @id @default(cuid())
+  type      ActivityType
+  userId    String?
+  user      User?        @relation(fields: [userId], references: [id])
+  blockId   String?
+  block     Block?       @relation(fields: [blockId], references: [id])
+  message   String       // pre-rendered display string, e.g. "@sam claimed block (42, 7)!"
+  metadata  Json?
+  isPublic  Boolean      @default(true)
+  createdAt DateTime     @default(now())
+
+  @@index([createdAt])
+  @@index([isPublic, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SYSTEM CONFIG — Key/value store for runtime-configurable settings.
+// Admin can update values without redeployment.
+// Example keys: "grid.width", "grid.height", "block.basePriceCents",
+//               "moderation.aiEnabled", "reservation.ttlMinutes"
+// ─────────────────────────────────────────────────────────────────
+
+model SystemConfig {
+  key         String   @id
+  value       Json
+  description String?
+  updatedAt   DateTime @updatedAt
+}
